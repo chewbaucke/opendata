@@ -1,4 +1,4 @@
-# RFC 0007: Global and Range Scan
+# RFC 0008: Global and Range Scan
 
 **Status**: Draft
 
@@ -9,45 +9,60 @@
 
 LogDb optimizes for per-key reads: entries sort by
 `(segment, key, relative_seq)`. That layout makes targeted reads cheap, but it
-is expensive for CDC, export, backup, and indexing jobs that need many keys.
+is expensive for CDC, export, backup, and indexing jobs that need to follow
+many keys.
 
-This RFC proposes a resumable global or key-range scan API. The cursor is a
-**manifest coordinate**: it pins a SlateDB checkpoint and records the source
-being consumed inside that checkpoint, including the LogDb segment, SlateDB
-WAL/L0/SR source, and last storage-key or WAL row position. After a checkpoint
-is consumed, following mode advances through manifest history and reads only the
-new WAL files, or new L0 SSTs when WAL is disabled.
+This RFC proposes a resumable range-based scan API. Rather than directing reads
+through SlateDb's usual query path, we propose to follow SSTs that are visible
+from the manifest and read log entries directly. As new L0s are created, we can
+directly read over a broad range of keys efficiently. A range scan covering all 
+keys reduces to reading every L0 with no query overhead.
 
-The design mostly fits SlateDB's current building blocks, but production-quality
-checkpoint handoff and slow-consumer retention need cleaner SlateDB APIs. Those
-gaps are listed as prerequisites.
+To make this possible, we need a cursor which tracks a consistent position
+within SlateDb's manifest history. The cursor pins a SlateDB checkpoint and
+records the source being consumed inside that checkpoint, including the LogDb
+segment, SlateDB WAL/L0/SR source, and last storage-key or WAL row position.
+With this, we can safely resume after failures or restarts. This proposal
+explains the mechanics of the manifest-based cursor and the semantics of the
+range scan API.
+
+SlateDb's existing APIs cover much of what we need, but there are some gaps.
+While a SlateDb checkpoint prevents cleanup of any SSTs referenced
+within the manifest that the checkpoint points to, it does not prevent cleanup
+of SSTs within subsequent manifests. We need the ability to lock all manifests
+above the checkpoint. We also need an API to read directly from an SST. This
+already exists for WALs, but not for SSTs. This document identifies gaps
+such as these, but leaves their design for separate work within SlateDb.
 
 ## Motivation
 
-LogDb encourages many independent keyed streams. Today a broad consumer must
-list keys and scan them one at a time, so cost scales with key cardinality.
-Global and range scans shift the work to the storage sources that contain log
-entries, enabling:
+LogDb is designed to represent many independent key streams. The key in SlateDb
+is structured as `(segment, log_key, relative_seq)`, which is optimized
+so that reading a sequence range from each individual stream is efficient.
+However, that efficiency does not scale to reads across a range of keys. To read
+from a range of keys with a bounded sequence range, we must read each key stream
+individually. There is no efficient alternative within the standard SlateDb APIs
+given our key structure. If we specify the full key range `(segment, log_key_start..)`
+up to `(segment, log_key_end)`, then we would read the full log of every key.
 
-- CDC consumers that replicate all LogDb records into another system.
-- Full export and backup workflows.
-- Reindexing jobs for secondary indexes or search systems.
-- Analytics and audit consumers that need complete record coverage.
-- Prefix or key-range scans without key enumeration.
-- Keyspace sharding, where multiple consumers own disjoint key ranges and each
-  advances an independent cursor.
+There are many use cases which require reads over ranges of keys. Pipeline
+use cases may use LogDb as a durable way to ship the data from all logs to other systems.
+An auditing use case would likely require viewing the log of every key.
+Without the ability to read across key ranges, LogDb cannot serve these
+workloads efficiently. We want to encourage large numbers of keys, but the
+more keys in the system, the more difficult it is to handle these use cases.
+
+A range-based scan API would address this gap. It generalizes to reads over
+all keys, and it enables parallel reading similar to Kafka's consumer groups. A set
+of readers can divide the keyspace so that each reader would see a subrange of keys. The
+ranges could be split or merged arbitrarily so that the number of readers can
+scale with the system load. 
 
 ## Goals
 
-- Read LogDb entries across all keys, or across a key scope, within a sequence
-  range.
+- Scan LogDb entries across an arbitrary key range.
 - Resume from a durable cursor without missing records.
 - Make scan cost proportional to data scanned, not key cardinality.
-- Allow independent consumers to split a scan by key prefix or key range.
-- Support a following mode that continues to surface newly durable records.
-- Keep garbage collection safe by tying retained SlateDB data to scanner-owned
-  checkpoints.
-- Identify SlateDB API gaps needed for a clean implementation.
 
 ## Non-Goals
 
@@ -56,11 +71,6 @@ entries, enabling:
 - Strict global sequence ordering during historical backfill. The scan returns
   each record's global sequence, but does not order different keys inside the
   same LogDb segment.
-- Reading non-durable writer memory from an out-of-process reader. Following is
-  defined over durable WAL/L0 state visible through SlateDB manifests.
-- Adding a sequence-ordered secondary index.
-- Defining retention policy. This RFC relies on SlateDB checkpoints to keep
-  scan sources alive while they are needed.
 
 ## Background
 
@@ -80,44 +90,71 @@ LogDb segment has its own LSM tree in the SlateDB manifest.
 
 Within a LogDb segment, entries sort by `user_key` and then `relative_seq`. They
 do not sort by global sequence. This is why per-key scans are efficient and why
-global sequence scans are not a simple byte-range scan.
+global sequence scans are not a simple byte-range scan. In fact, there is no
+convenient way to find the entry corresponding to a given global sequence number. One
+would need to do a range scan from every key until the sequence is found. This
+is what makes the global sequence unsuitable as a cursor.
+
+LogDb is an append-only system. When a segment has been sealed, then no further
+writes are possible on that segment. Within a segment, we do not need to merge
+keys across SSTs. Each L0 or SR contains a complete subrange of the keys present
+within them. This is an important fact which our design will depend on: we can
+read the log stream of each key (or range of keys) by scanning from each SR and L0 in
+the order defined by the manifest.
 
 ### SlateDB manifest order
 
-A SlateDB manifest version describes the durable sources for each tree:
+A SlateDB manifest version describes the durable sources for each segment tree:
 
-- the L0 SST views in each tree,
-- the compacted sorted runs in each tree,
 - the WAL id range needed for recovery,
-- the last L0 sequence persisted into the manifest, and
-- active checkpoints.
+- the L0 SST views in each tree, and
+- the compacted sorted runs in each tree.
 
-A checkpoint pins one manifest version and the files it needs. That lets a
-scanner decide when a manifest has been consumed before allowing GC to release
-its sources.
+This order reflects the precedence when SlateDb merges keys during query
+execution. WALs contain the most recent writes and always have the highest
+precedence. Next are the L0s which span the full key range, and the SRs.
 
-### SlateDB WAL order
-
-SlateDB 0.13 stores WALs as specialized SST files:
-
-- entries are appended in insertion order, which is expected to be SlateDB
-  sequence order;
-- the data blocks preserve that insertion order;
-- the index stores the first sequence number for each block, not the first key;
-- the SST info stores the first sequence number and has no normal last-key
-  bound.
-
-`WalReader` therefore gives an ordered change stream by WAL id and row order,
-but not a key-ordered table that can be pruned by user-key range.
-
-### Active-order problem
-
-A "last storage key read" cursor is safe only inside immutable data. In an
-active key-sorted view, a new write can sort behind the cursor. The scanner
-therefore consumes immutable sources named by manifest versions and discovers
-new data by following manifest progress.
+To read the entries for a LogDb key stream, a scan would begin at the oldest SR,
+and then work its way "upward" through the L0s. The most recent entries would be
+from the WALs (if enabled), which are replayed into a memtable. This is the
+same path that SlateDb's own query path, but significantly, it is not necessary
+to merge across layers. We know that the sequence range of each key must
+follow the order of the SSTs in the manifest. This is the insight that
+our design will depend on.
 
 ## Design
+
+At a high level, our design is based on the manifest ordering insight above.
+We can track our position within the manifest as a cursor so that it can be
+safely resumed. A checkpoint in SlateDb ensures that that position within
+the manifest remains valid as long as we need it. Our cursor tracks the specific
+L0/SR/WAL that we are reading from the checkpoint manifest. As we finish
+reading the SST, we advance to the next.
+
+We can efficiently read a range from each L0 and SR. In the worst case,
+we may fetch an unneeded block when the bloom filter is inaccurate. It is
+not possible to read a range efficiently from a WAL file because it is stored
+in write order. It is still reasonable to read from the WAL when we have a
+reader that is scanning the full log, but when reading a subrange, it may be
+better to wait for L0. This is a central amplification/latency tradeoff
+in this design.
+
+Additionally, it is important to understand how the LSM structure affects
+the ordering of the records that are returned. For data in the WAL, the
+records will be ordered precisely by the LogDb global sequence number.
+This ordering is not preserved for data in L0 and the SRs. To read
+efficiently from L0s and SRs, we have to take the order of the data
+within the SST, which means we cannot preserve the global sequence order
+outside of the WALs. We are guaranteed to return data from each key
+in its correct order, but sequence ordering across keys is not practical.
+
+The corollary of this is that reads across keys do not have a deterministic
+ordering. As compaction restructures new SRs, we do not have a consistent
+ordering across keys. This is another central tradeoff which stems directly
+from the structure of the LogDb key.
+
+Below we discuss the proposed API and then explain the cursor mechanics as
+well as the gaps that need to be filled in the SlateDb public API.
 
 ### Public API
 
@@ -125,24 +162,13 @@ The scan API belongs on `LogRead` so both `LogDb` and `LogDbReader` can expose
 it.
 
 ```rust
-pub enum LogScanScope {
-    AllKeys,
-    KeyPrefix(Bytes),
-    KeyRange(BytesRange),
-}
-
-pub enum LogScanMode {
-    Backfill,
-    Follow,
-}
-
-pub struct LogScanOptions {
-    pub scope: LogScanScope,
-    pub mode: LogScanMode,
-    pub cursor: Option<LogScanCursor>,
-}
-
 pub struct LogScanCursor(Bytes);
+
+impl LogScanCursor {
+  pub fn new(seq_range: impl RangeBounds<Sequence> + Send) -> Result<LogScanCursor> { ... }
+
+  pub fn from_bytes(bytes: Bytes) -> Result<LogScanCursor> { ... }
+}
 
 pub struct LogScanIterator { ... }
 
@@ -156,18 +182,15 @@ impl LogScanIterator {
 
 #[async_trait]
 pub trait LogRead {
-    async fn scan_log(
+    async fn scan_range(
         &self,
-        seq_range: impl RangeBounds<Sequence> + Send,
-        options: LogScanOptions,
+        key_range: impl RangeBounds<Bytes> + Send,
+        cursor: LogScanCursor,
     ) -> Result<LogScanIterator>;
 }
 ```
 
-Prefix and key-range scopes are user-key scopes, not raw SlateDB storage-key
-bounds. The implementation maps them into per-segment storage ranges.
-
-`LogScanCursor` is opaque bytes. Consumers persist the exact bytes returned by
+`LogScanCursor` is opaque bytes. Readers persist the exact bytes returned by
 the iterator and pass them back on resume. LogDb owns the encoding, versioning,
 and validation metadata; users should not inspect, construct, or modify cursor
 bytes.
@@ -179,42 +202,21 @@ Internally, the decoded cursor is a manifest coordinate:
 ```rust
 struct DecodedLogScanCursor {
     version: u8,
-    scope: LogScanScope,
     seq_range: SequenceRange,
-    high_watermark: Option<Sequence>,
-    checkpoints: CheckpointCursor,
-    phase: CursorPhase,
+    checkpoint: CheckpointRef,
+    position: ManifestPosition,
 }
 
 struct CheckpointRef {
     checkpoint_id: Uuid,
     manifest_id: u64,
 }
-
-struct CheckpointCursor {
-    current: CheckpointRef,
-    candidate: Option<CheckpointRef>,
-}
-
-enum CursorPhase {
-    Backfill(BackfillPosition),
-    Tail(TailPosition),
-    CaughtUp,
-}
 ```
 
-`current` is the consumed checkpoint. `candidate` pins the next manifest during
-handoff while the scanner consumes the delta from `current.manifest_id` to
-`candidate.manifest_id`.
-
-The source position depends on the kind of source:
+The manifest position depends on the source:
 
 ```rust
-struct BackfillPosition {
-    source: SourcePosition,
-}
-
-enum SourcePosition {
+enum ManifestPosition {
     Wal {
         wal_id: u64,
         row_offset: u64,
@@ -233,74 +235,177 @@ enum SourcePosition {
         last_key: Option<Bytes>,
     },
 }
-
-struct TailPosition {
-    from_manifest_id: u64,
-    to_manifest_id: u64,
-    source: SourcePosition,
-}
 ```
 
 For SST-backed sources, `last_key` is the raw SlateDB storage key last consumed
 from that source. For WAL sources, the cursor stores `wal_id` and `row_offset`.
-`high_watermark` is the largest acknowledged LogDb sequence and is used only for
-duplicate suppression during recovery paths.
 
 ### Establishing the initial checkpoint
 
-When a scan starts without a cursor, it creates a scanner-owned SlateDB
-checkpoint, records the checkpoint id and manifest id, loads that manifest, and
-starts in `Backfill`.
+When a scan starts, the database creates a scanner-owned SlateDB checkpoint,
+records the checkpoint id and manifest id, and loads that manifest. The initial cursor
+position is based on the lower bound of the sequence range of the scan.
+We use the lower bound sequence to find the segment that the initial records
+are contained within. The initial manifest position is set using the oldest
+sorted run for that segment in the checkpoint manifest.
+
+The sequence range maps to segments through `SegmentMeta` records visible in the
+checkpoint. Each segment covers a half-open global sequence range
+`[segment.start_seq, next_segment.start_seq)`. For the active segment, the
+effective end is the smaller of the requested upper bound and the scanner's
+current durable frontier. For an unbounded following scan, that frontier advances
+as subsequent manifests are consumed.
+
+```text
+SegmentMeta visible at checkpoint C
+
+              segment 1           segment 2           segment 3
+global seq    [0, 40)             [40, 90)            [90, 140)
+              sealed              sealed              active at C
+
+scan range                         [55, 120)
+segments touched                    segment 2          segment 3
+initial source                      oldest source in segment 2
+```
+
+Operationally, the scanner lists the segment metadata in `start_seq` order and
+keeps the segments whose global sequence span intersects the requested sequence
+range. Within each segment, the global range is relativized against
+`segment.start_seq` before it is passed to storage-key construction or
+sequence-aware SST filters. For the example above, segment 2 receives
+`[15, 50)` and segment 3 receives `[0, 30)`.
 
 For a writer-local `LogDb`, `CheckpointScope::All` may be used to force
 in-memory state into durable WAL/L0 before creating the checkpoint. For a
 standalone `LogDbReader`, the scanner cannot flush writer memory, so the scan
 starts from the durable state already visible in the manifest and WAL.
 
-### Backfill
+### Scanning a segment LSM
 
-Backfill reads LogDb entries visible through the checkpointed manifest and
-matching the scope and sequence range.
-
-The SST-backed portion is emitted per LogDb segment in ascending segment id:
-
-1. Build the visible source set for that segment from L0 SST views and
-   compacted sorted runs.
-2. Read rows from those sources, merging or buffering as needed to preserve the
-   ordering contract.
-3. Apply scope and sequence filtering while decoding `LogEntryKey`.
-4. Advance the source coordinate after records are yielded and acknowledged.
-
-If WAL is enabled, the checkpointed view may include WAL files not yet flushed
-into L0:
+Each segment contains its own LSM tree. The levels of the LSM partition the
+global sequence range into disjoint subranges. That is, each level (WAL/L0/SR)
+contains a disjoint subrange which is strictly greater than each lower level.
+For example, the sequence range of an L0 SST is strictly higher than any prior
+L0 and all SRs.
 
 ```text
-(manifest.replay_after_wal_id, manifest.next_wal_sst_id)
+One LogDb segment in manifest C
+
+newest
+  WAL        [118, 126)
+  L0-4       [104, 118)
+  L0-3       [ 91, 104)
+  SR-2       [ 64,  91)
+  SR-1       [ 32,  64)
+  SR-0       [  0,  32)
+oldest
+
+scan range: [70, 112)
+read:       SR-2, L0-3, L0-4
+skip:       SR-0, SR-1, WAL
 ```
 
-The implementation may need to merge or buffer WAL and SST rows to preserve the
-public ordering contract.
+A scan begins with the oldest sorted run and proceeds through each subsequent level
+of the LSM. We only need to scan the levels that intersect the sequence range that we are
+scanning, but we do not know which levels these are ahead of time. In RFC 7, we defined
+a filter policy which leverages sequence range metadata which is stored in each SST.
+As we scan the each level, we can skip any SSTs which do not intersect the scan range.
 
-When all sources in the checkpointed manifest are consumed, the cursor enters
-`CaughtUp` for that manifest. In `Backfill` mode, the iterator ends and the
-scanner may delete its owned checkpoint. In `Follow` mode, the scanner starts
-the checkpoint handoff loop.
+### Scan Locality and Performance
+
+The efficiency of a scan depends on the level that is being read, and on the
+granularity of the scan (both key range and sequence range). Consider a scan
+over the sorted runs. The more data that gets compacted into an SR,
+the worse the efficiency will be when scanning a specific sequence range. Our
+key structure does not let us easily pick out the keys contained in the sequence
+range, so we must scan the logs for all keys. We can use the segment size as a
+way to bound the worst-case behavior. Smaller segments implies fewer entries
+for each log stream within that segment.
+
+```text
+Storage order inside one sorted run
+
+key prefix a* scan range
+|
+v
++----------------+-------------------------------+
+| user key       | relative sequences in key run |
++----------------+-------------------------------+
+| a/0001         |  0   8  13 [64  71]  96       |
+| a/0002         |  4  17  48 [67  72] 101       |
+| a/0003         |  2  19  35 [63]     88        |
++----------------+-------------------------------+
+| b/0001         |  1  12 [65] 90                |
++----------------+-------------------------------+
+
+wanted sequence range: [60, 80)
+```
+
+The key prefix is contiguous, so the scanner can avoid `b/0001`. The sequence
+range is not contiguous in storage, however. It appears as a local slice inside
+each matching key run, which means a prefix scan over `a*` reads all entries for
+the `a*` keys in that sorted run and filters by sequence while decoding.
+
+A scan over L0 has the same issue, but its scope is more limited.
+The problem instead is that L0s cover the entire keyspace. This means that reading
+a fine-grained key range will likely involve read amplification. We may fetch
+some blocks containing keys outside of the range. Tuning the size of L0 files and
+the block size is necessary to control read amplification.
+
 
 ### Following manifest progress
 
-Following mode advances from one consumed manifest to a later manifest that
-introduces new durable data. The scanner distinguishes:
+The cursor points to a single manifest. We read from each segment in the scan range
+contained in the current manifest before advancing the cursor to the next. If all segments
+in the scan range are sealed and contained within that manifest, then the scan ends
+and the checkpoint is dropped. Alternatively, if we find a sequence number referenced
+in the current manifest which is larger than the upper bound of our sequence range, then
+we know that the manifest itself contains the full sequence range and there is no
+need to advance to the next manifest.
 
-- **Ingestion frontier changes** introduce new logical records: new WAL files
-  when WAL is enabled, or new L0 SST views when WAL is disabled.
-- **Reorganization changes** only move existing records: L0 compaction, sorted
-  run compaction, and segment drains.
+If the scan continues into the active log segment and we have not found the upper
+bound within the current manifest, then we need to advance to the next manifest.
+If that manifest does not exist, then we must await it. An iterator following
+an unbounded scan range will automatically receive new data as it is discovered
+by the reader's own manifest polling loop.
 
-The tailer consumes only ingestion frontier changes.
+We cannot advance the manifest arbitrarily or we risk invalidating our position.
+Imagine that an L0 that we had not read was merged into a new sorted run with
+other L0s that we have read. We would have no easy way to find our position
+within the newly created sorted run. Once we have read completely from an existing
+manifest, then we begin following the chain of newly created L0s. We must check
+each subsequent manifest version to find the new L0s.
+
+```text
+Manifest history for one LogDb segment
+
+M10  checkpoint consumed
+     SR: S0
+     L0: L0-7  L0-8
+
+M11  ingestion frontier advanced
+     SR: S0
+     L0: L0-7  L0-8  L0-9     <- consume L0-9
+
+M12  ingestion frontier advanced
+     SR: S0
+     L0: L0-7  L0-8  L0-9  L0-10
+                                  <- consume L0-10
+
+M13  compaction only
+     SR: S1 = compact(L0-7, L0-8, L0-9)
+     L0: L0-10
+```
+
+The safe following path is `M10 -> M11 -> M12`: each manifest exposes the newly
+introduced L0 before it can be compacted into a sorted run with older sources.
+Jumping directly from `M10` to `M13` loses the simple L0 delta because `L0-9`
+has been merged with sources that the cursor may already have consumed.
+
 
 #### WAL-enabled delta
 
-If WAL is enabled, the delta from manifest `M` to manifest `N` is the WAL id
+If the WAL is enabled, the delta from manifest `M` to manifest `N` is the WAL id
 range:
 
 ```text
@@ -337,86 +442,15 @@ If the scanner misses the manifest that introduced an L0 and the L0 has been
 compacted and GC'd, it falls back to `sequence > high_watermark` on the target
 checkpoint or reports `CursorTooOld`.
 
-### Key-range partitioning
-
-The same cursor model works for all keys and for disjoint key ranges:
-
-```text
-consumer 0: LogScanScope::KeyRange(a..f)
-consumer 1: LogScanScope::KeyRange(f..m)
-consumer 2: LogScanScope::KeyRange(m..)
-```
-
-Each consumer owns a checkpoint cursor and advances independently. The cursor
-includes `scope`, so a cursor for one range cannot resume another range.
-
-SST-backed sources are efficient because entries are key-sorted inside each
-LogDb segment. The implementation derives a storage range for
-`record_type=LogEntry` plus the user scope, then opens overlapping L0/SR views
-and blocks.
-
-WAL-backed sources are filtering operations because WAL SSTs are
-sequence/insertion ordered and indexed by sequence, not key. Options:
-
-- accept duplicate WAL reads across range consumers in v1;
-- run one WAL follower that demultiplexes rows to range-owned workers;
-- disable WAL for range-sharded following so the tail source is key-sorted L0;
-- add a new key-range-aware WAL/CDC index or per-range tail structure.
-
-The last option is outside this RFC unless WAL-enabled range sharding becomes a
-hard requirement.
-
-### Checkpoint handoff
-
-Checkpoint handoff must pin both the consumed manifest and the target manifest
-until consumer progress is durable.
-
-For a scanner at consumed manifest `M`:
-
-1. Poll or list manifest versions after `M`.
-2. Choose the next manifest `N` that contains an ingestion frontier change.
-3. Create a candidate checkpoint for `N`.
-4. Persist a cursor containing both `M` and `N`.
-5. Consume the delta from `M` to `N`.
-6. After the consumer durably persists the cursor at the end of the delta,
-   promote `N` to `current` and delete the old checkpoint for `M`.
-
-This avoids deleting the old checkpoint too early and avoids reading unpinned
-WAL/L0 sources.
-
-An atomic SlateDB "advance checkpoint and return diff" operation could collapse
-this to one checkpoint. Until then, handoff uses a candidate checkpoint.
-
-### Manifest selection
-
-The scanner should not blindly jump to the latest manifest. With WAL enabled,
-that is safe only when all WAL ids in
-`M.next_wal_sst_id .. latest.next_wal_sst_id` are retained. With WAL disabled,
-the scanner should process manifest history in order so it can see the first
-manifest that introduced each L0 view.
-
-The scanner therefore uses manifest history as part of the cursor protocol:
-
-```text
-current manifest M
-  -> next retained ingest manifest N
-  -> consume frontier delta
-  -> promote N
-```
-
-If required history is missing, the scanner returns `CursorTooOld` unless
-fallback rescan is enabled.
-
 ### Filtering
 
-Every source reader applies the same filters:
+Reading directly from SSTs means the potential to see records which are not
+log entries. Every source reader applies the same filters:
 
 1. Key must decode as `RecordType::LogEntry`.
 2. LogDb segment id must be a user segment, not the system segment.
-3. User key must match `LogScanScope`.
-4. Log sequence must be within the requested sequence range.
-5. Log sequence must be greater than `high_watermark` when duplicate
-   suppression is required.
+3. Log key must be wiithin the requested key range.
+3. Log sequence must be within the requested sequence range.
 
 Metadata, listing, sequence block, tombstone, and merge rows are skipped. A
 non-value log entry row is corruption or an unsupported future format.
@@ -438,9 +472,6 @@ The ordering contract is:
 This applies to global, prefix, and key-range scans. WAL-backed scans may read
 in WAL id and row-offset order, but that source order is not part of the API.
 
-A future `require_sequence_order` option could define inter-key order, likely
-using WAL-backed following or a bounded k-way merge/sort for backfill.
-
 ### Failure and resume
 
 The scanner is at-least-once at the API boundary. Consumers persist a cursor
@@ -456,20 +487,7 @@ On resume:
 5. Apply `high_watermark` duplicate suppression when needed.
 
 If any checkpoint, manifest, WAL file, or SST view required by the cursor is
-missing, the scanner returns `CursorTooOld` unless fallback rescan is enabled.
-
-### Fallback rescan
-
-When the exact delta source is unavailable, the scanner can rescan the target
-checkpoint and filter by LogDb sequence:
-
-```text
-emit entries where sequence > high_watermark
-```
-
-This is correct because LogDb sequences are monotonic, but it is
-O(target checkpoint size) instead of O(delta). It is a recovery path, not the
-steady-state following mechanism.
+missing, the scanner returns `ExpiredCursor`.
 
 ## SlateDB Prerequisites
 
