@@ -130,11 +130,13 @@ we last read. This position can be made durable with a SlateDb checkpoint
 to ensure that the manifest and the referenced data is not garbage collected.
 We can read all of the L0s and SRs from the checkpoint manifest
 
-We can efficiently read the range of blocks from each L0 and SR that matches
-a range of keys. It is not possible to read a range efficiently
-from a WAL file because it is stored in write order. When scanning all keys,
-this is fine,  but when reading a subrange, it may be better to wait for L0.
-This is a central amplification/latency tradeoff in this design.
+We can efficiently read the range of blocks from an L0 or SR that matches
+our key range since they are sorted by key. It is not possible to read a range
+efficiently from a WAL file because stored in write order. If we are scanning all keys,
+then there is no issue, but when reading a subrange, the WAL entries must be
+filtered which means increased read amplification.
+It might be better to skip the WAL and await L0s in this case. This is a
+central latency tradeoff in this design.
 
 Additionally, it is important to understand how the LSM structure affects
 the ordering of the records that are returned. For data in the WAL, the
@@ -147,8 +149,8 @@ in its correct order, but sequence ordering across keys is not practical.
 
 The corollary of this is that reads across keys do not have a deterministic
 ordering. As compaction restructures new SRs, the entries for each log key
-are located closer together, which means the overall order in the SST changes. 
-This is another central tradeoff which stems directly
+are located closer together, which means the overall order across keys
+in the SST changes. This is another central tradeoff which stems directly
 from the structure of the LogDb key. Below we discuss the proposed API and
 then explain the cursor mechanics and the reader semantics.
 
@@ -349,7 +351,7 @@ some blocks containing keys outside of the range. Tuning the size of L0 files an
 the block size is necessary to control read amplification.
 
 
-### Following manifest progress
+### Advancing the manifest frontier
 
 The cursor points to a single manifest. We read from each segment in the scan range
 contained in the current manifest before advancing the cursor to the next. If all segments
@@ -365,39 +367,85 @@ If that manifest does not exist, then we must await it. An iterator following
 an unbounded scan range will automatically receive new data as it is discovered
 by the reader's own manifest polling loop.
 
-We cannot advance the manifest arbitrarily or we risk invalidating our position.
-Imagine that an L0 that we had not read was merged into a new sorted run with
-other L0s that we have read. We would have no easy way to find our position
-within the newly created sorted run. Once we have read completely from an existing
-manifest, then we begin following the chain of newly created L0s. We must check
-each subsequent manifest version to find the new L0s.
+The manifest pointed to by the cursor is known as the frontier. The central challenge
+in this RFC is how to safely advance the frontier without missing data. To get
+a picture of the problem, imagine that an L0 that we had not read was merged into a
+new SR with other L0s that we have read. We would have no easy way to find our position
+within the newly created sorted run.
 
 ```text
-Manifest history for one LogDb segment
+Frontier M10
 
-M10  checkpoint consumed
-     SR: S0
-     L0: L0-7  L0-8
+  sorted runs
+    S0
 
-M11  ingestion frontier advanced
-     SR: S0
-     L0: L0-7  L0-8  L0-9     <- consume L0-9
+  L0s
+    L0-7  [already read]
+    L0-8  [not read]
 
-M12  ingestion frontier advanced
-     SR: S0
-     L0: L0-7  L0-8  L0-9  L0-10
-                                  <- consume L0-10
+Cursor position: after L0-7, before L0-8
 
-M13  compaction only
-     SR: S1 = compact(L0-7, L0-8, L0-9)
-     L0: L0-10
+
+Later manifest M13
+
+  sorted runs
+    S0
+    S1 = compact(L0-7, L0-8)
+
+  L0s
+    L0-9
 ```
 
-The safe following path is `M10 -> M11 -> M12`: each manifest exposes the newly
-introduced L0 before it can be compacted into a sorted run with older sources.
-Jumping directly from `M10` to `M13` loses the simple L0 delta because `L0-9`
-has been merged with sources that the cursor may already have consumed.
+The missing data from `L0-8` is now mixed into `S1` with data from `L0-7`.
+Skipping `S1` would miss `L0-8`; reading `S1` from the beginning would duplicate
+rows from `L0-7`. A cursor that only names the old source cannot seek to "the
+part of `S1` that came from `L0-8`."
 
+If we cannot determine which data is new, then we can scan all levels of the
+segment that the cursor currently points to. We can retain the maximum log sequence
+number that we have observed from the prior manifest across all keys in the range.
+New log entries in the same range are guaranteed to have a larger sequence.
+
+This is only necessary when the chain of L0s cannot be followed. If our L0 position
+is still valid in a new manifest version, then we can continue following using
+the new L0s. This suggests an alternative approach. Rather than skipping ahead
+to the latest manifest, we could follow manifest versions sequentially. If we do so,
+then we are ensured to see each L0 while it is still named in a manifest.
+
+A checkpoint in SlateDb is a lock on a single manifest version and all of the data
+that it refers to. We could ensure that no manifest versions are missed by extending
+the lock to cover a range of manifests. This makes garbage collection more complicated
+and prevents cleanup in cases where a reader has crashed for an extended amount of
+time.
+
+One alternative is to extend SlateDb's own bookkeeping so that we know which
+SlateDb-based sequence numbers are contained in each level. This provides a simpler
+way to find the data that is new. If an L0 that we have read is merged into a new
+sorted run with an L0 that we have not read, then the sequence numbers will tell
+us exactly which sorted run we need to resume from. We will have to filter the
+data fetched from that sorted run, but this allows us to skip over older sorted
+runs which have already been read. It gives us a precise method to find the next
+level that we need regardless of where it is located.
+
+```text
+Same M13 with SlateDB write-sequence coverage
+(`db_seq` is SlateDB's write sequence, not LogDb's global sequence)
+
+Cursor frontier
+  consumed db_seq <= 119
+
+M13 sources
+  S0                         db_seq [  0,  79]   skip
+  S1 = compact(L0-7, L0-8)   db_seq [ 80, 139]   read + filter
+       from L0-7             db_seq [ 80, 119]   duplicate
+       from L0-8             db_seq [120, 139]   new
+  L0-9                       db_seq [140, 159]   read
+```
+
+With this metadata, `S1` is known to overlap the unread SlateDB sequence range,
+so the scanner reads it and emits only rows with `db_seq > 119`. Older sorted
+runs such as `S0` can be skipped because their sequence coverage is entirely
+below the cursor frontier.
 
 #### WAL-enabled delta
 
