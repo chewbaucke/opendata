@@ -517,14 +517,26 @@ impl CompactionFilterSupplier for VectorCompactionFilterSupplier {
         &self,
         context: &CompactionJobContext,
     ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
-        // TODO: extend CompactionJobContext to include job spec and check for fts segment, and
-        //       for resumed fts last-sr jobs (and fail these)
+        // TODO: extend CompactionJobContext with job spec / FTS segment so
+        // non-FTS last-run jobs are not gated by this resume check.
         // Apply FTS deletes only when compacting to the last (oldest) sorted run.
         // There every key for a given vector — postings, term stats, per-vector
         // field stats — is guaranteed present, so a delete observes all of a
         // vector's keys in one pass and the cleanup is consistent. For any other
         // compaction the filter is a strict no-op (RFC-0006).
+        //
+        // A last-run job that is *resuming* skips keys already written to
+        // output SSTs. This filter is born `Init` and only the deletions
+        // sentinel may leave that phase, so a resume past the sentinel
+        // livelocks (`unexpected phase Init`). Fail at supplier time; SlateDB
+        // reschedules from key zero on CreationError.
         if context.is_dest_last_run {
+            if context.is_resume {
+                return Err(CompactionFilterError::CreationError(
+                    "FTS compaction filter: refusing resumed last-run job (restart from key zero)"
+                        .into(),
+                ));
+            }
             Ok(Box::new(VectorCompactionFilter::new(
                 context.retention_min_seq,
             )))
@@ -708,6 +720,54 @@ mod tests {
         // a partial delete pass
         assert!(result.is_err());
         assert_eq!(filter.phase, FilterPhase::Init);
+    }
+
+    fn job_context(is_dest_last_run: bool, is_resume: bool) -> CompactionJobContext {
+        CompactionJobContext {
+            destination: 0,
+            is_dest_last_run,
+            compaction_clock_tick: 0,
+            retention_min_seq: None,
+            is_resume,
+        }
+    }
+
+    #[tokio::test]
+    async fn should_fail_resumed_last_run_at_supplier() {
+        match VectorCompactionFilterSupplier
+            .create_compaction_filter(&job_context(true, true))
+            .await
+        {
+            Err(err) => assert!(
+                err.to_string().contains("refusing resumed last-run job"),
+                "got {err}"
+            ),
+            Ok(_) => panic!("resumed last-run must fail closed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_install_real_filter_on_fresh_last_run() {
+        let mut filter = VectorCompactionFilterSupplier
+            .create_compaction_filter(&job_context(true, false))
+            .await
+            .unwrap_or_else(|_| panic!("fresh last-run installs the FTS filter"));
+        assert_eq!(
+            filter.filter(&sentinel_entry()).await.unwrap(),
+            CompactionFilterDecision::Keep
+        );
+    }
+
+    #[tokio::test]
+    async fn should_install_noop_on_resumed_non_last_run() {
+        let mut filter = VectorCompactionFilterSupplier
+            .create_compaction_filter(&job_context(false, true))
+            .await
+            .unwrap_or_else(|_| panic!("non-last-run stays no-op even when resuming"));
+        assert_eq!(
+            filter.filter(&deletions_entry(&[1])).await.unwrap(),
+            CompactionFilterDecision::Keep
+        );
     }
 
     #[tokio::test]

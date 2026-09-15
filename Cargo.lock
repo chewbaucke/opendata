@@ -4776,9 +4776,8 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 
 [[package]]
 name = "slatedb"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d01d14107ae93175aff71ab4174a09da323cc95c4cddd7ee253ae1649211d3d9"
+version = "0.14.1"
+source = "git+https://github.com/chewbaucke/slatedb?branch=cell%2F0.14.1-fts-resume#d4097ce04e248548efb57099efb70d09e05ebf9c"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -4821,9 +4820,8 @@ dependencies = [
 
 [[package]]
 name = "slatedb-common"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7696aae130a0a617ec44e7c9e731d6f5408f58d949a91ba5082fcab84a896be"
+version = "0.14.1"
+source = "git+https://github.com/chewbaucke/slatedb?branch=cell%2F0.14.1-fts-resume#d4097ce04e248548efb57099efb70d09e05ebf9c"
 dependencies = [
  "chrono",
  "log",
@@ -4837,9 +4835,8 @@ dependencies = [
 
 [[package]]
 name = "slatedb-txn-obj"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a5748b15b53b41beac51663a6b05168ac2af1a7abcada92b7720a483beddd30"
+version = "0.14.1"
+source = "git+https://github.com/chewbaucke/slatedb?branch=cell%2F0.14.1-fts-resume#d4097ce04e248548efb57099efb70d09e05ebf9c"
 dependencies = [
  "async-trait",
  "bytes",
