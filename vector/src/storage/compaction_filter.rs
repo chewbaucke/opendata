@@ -20,6 +20,11 @@
 //! and per-vector field stats — are present together in the compaction, so a
 //! delete is observed and applied consistently in a single pass.
 //!
+//! Last-run FTS jobs also declare themselves **unsplittable**
+//! ([`CompactionFilterSupplier::is_splittable`]). The filter is a per-job
+//! phase machine and the deletions sentinel is per-segment; an RFC-0028
+//! subcompaction split would start later ranges past the sentinel and Init-fail.
+//!
 //! # What it does (last-run compactions)
 //!
 //! For an FTS-segment compaction reaching the last sorted run, the filter (in
@@ -518,7 +523,8 @@ impl CompactionFilterSupplier for VectorCompactionFilterSupplier {
         context: &CompactionJobContext,
     ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
         // TODO: extend CompactionJobContext with job spec / FTS segment so
-        // non-FTS last-run jobs are not gated by this resume check.
+        // non-FTS last-run jobs are not gated by this resume check or the
+        // no-split declaration below.
         // Apply FTS deletes only when compacting to the last (oldest) sorted run.
         // There every key for a given vector — postings, term stats, per-vector
         // field stats — is guaranteed present, so a delete observes all of a
@@ -543,6 +549,14 @@ impl CompactionFilterSupplier for VectorCompactionFilterSupplier {
         } else {
             Ok(Box::new(NoOpCompactionFilter))
         }
+    }
+
+    fn is_splittable(&self, context: &CompactionJobContext) -> bool {
+        // Last-run installs the FTS phase machine, which requires the
+        // deletions sentinel (first key in the segment). RFC-0028
+        // subcompaction splits would start later ranges past the sentinel.
+        // Non-last-run is a no-op and can split.
+        !context.is_dest_last_run
     }
 }
 
@@ -744,6 +758,18 @@ mod tests {
             ),
             Ok(_) => panic!("resumed last-run must fail closed"),
         }
+    }
+
+    #[test]
+    fn should_declare_last_run_unsplittable() {
+        assert!(
+            !VectorCompactionFilterSupplier.is_splittable(&job_context(true, false)),
+            "last-run FTS must not split: the sentinel is per-segment and sorts first"
+        );
+        assert!(
+            VectorCompactionFilterSupplier.is_splittable(&job_context(false, false)),
+            "non-last-run is a no-op and can split"
+        );
     }
 
     #[tokio::test]
