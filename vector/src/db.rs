@@ -45,7 +45,9 @@ use async_trait::async_trait;
 use common::Record;
 use common::SequenceAllocator;
 use common::StorageBuilder;
-use common::coordinator::{Durability, WriteCoordinator, WriteCoordinatorConfig};
+use common::coordinator::{
+    Durability, WriteCoordinator, WriteCoordinatorConfig, WriteError, WriteHandle,
+};
 use common::storage::{Storage, StorageRead, StorageSnapshot};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -603,6 +605,52 @@ impl VectorDb {
             .await
             .map_err(|e| Error::Internal(format!("{}", e)))?;
 
+        Ok(())
+    }
+
+    /// Enqueue a write and return the coordinator handle without waiting.
+    /// Callers wait at the durability they need (`Applied` vs `Durable`).
+    pub(crate) async fn write_handle(
+        &self,
+        vectors: Vec<Vector>,
+    ) -> Result<WriteHandle<Arc<dyn std::any::Any + Send + Sync + 'static>>> {
+        let mut writes = Vec::with_capacity(vectors.len());
+        for vector in vectors {
+            writes.push(self.prepare_vector_write(vector)?);
+        }
+
+        metrics::counter!(VECTOR_UPSERTS_TOTAL).increment(writes.len() as u64);
+
+        self.write_coordinator
+            .handle(WRITE_CHANNEL)
+            .write(VectorDbOp::Write(writes))
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))
+    }
+
+    /// Fire-and-forget storage flush. Backpressure means a flush is already
+    /// queued — the caller's `wait(Durable)` still observes it.
+    pub async fn trigger_flush(&self) -> Result<()> {
+        match self
+            .write_coordinator
+            .handle(WRITE_CHANNEL)
+            .flush(true)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(WriteError::Backpressure(_)) => Ok(()),
+            Err(e) => Err(Error::Internal(format!("{e}"))),
+        }
+    }
+
+    /// Enqueue a write, trigger a flush, and wait until the batch is durable.
+    pub async fn write_durable(&self, vectors: Vec<Vector>) -> Result<()> {
+        let mut handle = self.write_handle(vectors).await?;
+        self.trigger_flush().await?;
+        handle
+            .wait(Durability::Durable)
+            .await
+            .map_err(|e| Error::Internal(format!("{e}")))?;
         Ok(())
     }
 

@@ -2118,7 +2118,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.57.0",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -4777,7 +4777,7 @@ checksum = "7a2ae44ef20feb57a68b23d846850f861394c2e02dc425a50098ae8c90267589"
 [[package]]
 name = "slatedb"
 version = "0.14.1"
-source = "git+https://github.com/chewbaucke/slatedb?rev=329ce8c0c7b582f5002f3f93e02f4e9191a5c9cf#329ce8c0c7b582f5002f3f93e02f4e9191a5c9cf"
+source = "git+https://github.com/chewbaucke/slatedb?rev=383ad096a5dd281cc44add419502986c514cdb09#383ad096a5dd281cc44add419502986c514cdb09"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -4821,7 +4821,7 @@ dependencies = [
 [[package]]
 name = "slatedb-common"
 version = "0.14.1"
-source = "git+https://github.com/chewbaucke/slatedb?rev=329ce8c0c7b582f5002f3f93e02f4e9191a5c9cf#329ce8c0c7b582f5002f3f93e02f4e9191a5c9cf"
+source = "git+https://github.com/chewbaucke/slatedb?rev=383ad096a5dd281cc44add419502986c514cdb09#383ad096a5dd281cc44add419502986c514cdb09"
 dependencies = [
  "chrono",
  "log",
@@ -4836,7 +4836,7 @@ dependencies = [
 [[package]]
 name = "slatedb-txn-obj"
 version = "0.14.1"
-source = "git+https://github.com/chewbaucke/slatedb?rev=329ce8c0c7b582f5002f3f93e02f4e9191a5c9cf#329ce8c0c7b582f5002f3f93e02f4e9191a5c9cf"
+source = "git+https://github.com/chewbaucke/slatedb?rev=383ad096a5dd281cc44add419502986c514cdb09#383ad096a5dd281cc44add419502986c514cdb09"
 dependencies = [
  "async-trait",
  "bytes",
