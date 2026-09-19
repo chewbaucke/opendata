@@ -49,10 +49,10 @@ serde_json = "1.0"
 serde_with = { version = "3", features = ["base64"] }
 serde_yaml = "0.9"
 foyer = "0.22"
-# Cell patch-fork-until-merge: same 0.14.1 pin plus is_resume + key-zero routing.
-# Keep the crate version string at 0.14.1 so ^0.14.0 requirements resolve.
-slatedb = { git = "https://github.com/chewbaucke/slatedb", branch = "cell/0.14.1-fts-resume", features = ["compaction_filters"] }
-slatedb-common = { git = "https://github.com/chewbaucke/slatedb", branch = "cell/0.14.1-fts-resume" }
+# Cell patch-fork-until-merge: 0.14.1 + is_resume + key-zero + source_missing.
+# Architect §28: pin by commit sha, not branch (reproducible image builds).
+slatedb = { git = "https://github.com/chewbaucke/slatedb", rev = "329ce8c0c7b582f5002f3f93e02f4e9191a5c9cf", features = ["compaction_filters"] }
+slatedb-common = { git = "https://github.com/chewbaucke/slatedb", rev = "329ce8c0c7b582f5002f3f93e02f4e9191a5c9cf" }
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full", "test-util"] }
 tokio-util = "0.7"
