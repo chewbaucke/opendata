@@ -885,6 +885,24 @@ impl VectorDb {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
+        let mut handle = self.delete_handle(ids).await?;
+        handle
+            .wait(Durability::Applied)
+            .await
+            .map_err(|e| Error::Internal(format!("{}", e)))?;
+        Ok(())
+    }
+
+    /// Enqueue a delete and return the coordinator handle without waiting.
+    /// Callers wait at the durability they need (`Applied` vs `Durable`).
+    pub(crate) async fn delete_handle<I, S>(
+        &self,
+        ids: I,
+    ) -> Result<WriteHandle<Arc<dyn std::any::Any + Send + Sync + 'static>>>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let mut collected: Vec<String> = Vec::new();
         for id in ids {
             let id: String = id.into();
@@ -899,16 +917,29 @@ impl VectorDb {
 
         metrics::counter!(VECTOR_DELETES_TOTAL).increment(collected.len() as u64);
 
-        let mut handle = self
-            .write_coordinator
+        self.write_coordinator
             .handle(WRITE_CHANNEL)
             .write(VectorDbOp::Delete(collected))
             .await
-            .map_err(|e| Error::Internal(format!("{}", e)))?;
+            .map_err(|e| Error::Internal(format!("{}", e)))
+    }
+
+    /// Enqueue a delete, trigger a flush, and wait until the tombstone is durable.
+    ///
+    /// `delete` waits `Applied` only. A crash between that ACK and WAL flush
+    /// resurrects the vector on reopen. Hot-path delete ACK and migration
+    /// tombstones must use this composition (same shape as `write_durable`).
+    pub async fn delete_durable<I, S>(&self, ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut handle = self.delete_handle(ids).await?;
+        self.trigger_flush().await?;
         handle
-            .wait(Durability::Applied)
+            .wait(Durability::Durable)
             .await
-            .map_err(|e| Error::Internal(format!("{}", e)))?;
+            .map_err(|e| Error::Internal(format!("{e}")))?;
         Ok(())
     }
 
@@ -1365,6 +1396,51 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].vector.id, "vec-1");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::needless_return)]
+    async fn delete_durable_survives_drop_without_close() {
+        use common::storage::config::{
+            LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
+        };
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let storage_config = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".to_string(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: tmp_dir.path().to_str().unwrap().to_string(),
+            }),
+            settings_path: None,
+            block_cache: None,
+            meta_cache: None,
+        });
+
+        let config = Config {
+            storage: storage_config.clone(),
+            dimensions: 3,
+            distance_metric: DistanceMetric::L2,
+            ..Default::default()
+        };
+
+        {
+            let db = VectorDb::open(config.clone()).await.unwrap();
+            db.write_durable(vec![Vector::new("vec-1", vec![1.0, 0.0, 0.0])])
+                .await
+                .unwrap();
+            db.delete_durable(["vec-1"]).await.unwrap();
+            drop(db);
+        }
+
+        let db2 = VectorDb::open(config).await.unwrap();
+        let results = db2
+            .search(&Query::new(vec![1.0, 0.0, 0.0]).with_limit(1))
+            .await
+            .unwrap();
+        assert!(
+            results.is_empty(),
+            "delete_durable must not resurrect across drop-without-close"
+        );
     }
 
     #[tokio::test]
