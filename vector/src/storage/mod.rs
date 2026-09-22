@@ -366,6 +366,37 @@ pub(crate) async fn build_vector_storage(
         .map_err(|e| Error::Storage(format!("Failed to create storage: {e}")))
 }
 
+/// Standalone compactor for one vector prefix (P5).
+///
+/// The writer opens with `compactor_options = null` so this process owns the
+/// compactor epoch. Wiring matches the in-process path: FTS filter (no-op on
+/// ANN segments) and the vector merge operator. Runs until the compactor
+/// stops or the manifest is missing.
+pub async fn run_standalone_compactor(config: &Config) -> Result<()> {
+    let Some(builder) = new_slatedb_compactor_builder(&config.storage)
+        .map_err(|e| Error::Storage(format!("Failed to create compactor: {e}")))?
+    else {
+        return Err(Error::Storage(
+            "standalone compactor requires compactor_options in SlateDB settings".into(),
+        ));
+    };
+    let merge_op: Arc<merge_operator::VectorDbMergeOperator> = Arc::new(
+        merge_operator::VectorDbMergeOperator::new(config.dimensions as usize),
+    );
+    let compactor = builder
+        .with_compaction_filter_supplier(
+            compaction_filter::VectorCompactionFilterSupplier::shared(),
+        )
+        .with_merge_operator(Arc::new(SlateDbStorage::merge_operator_adapter(
+            merge_op,
+        )))
+        .build();
+    compactor
+        .run()
+        .await
+        .map_err(|e| Error::Storage(format!("compactor exited: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

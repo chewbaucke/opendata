@@ -62,3 +62,11 @@ pub use model::{
     SearchResult, Vector, VectorBuilder,
 };
 pub use reader::VectorDbReader;
+
+/// Run the standalone compactor for one prefix until it exits.
+///
+/// Writer settings must set `compactor_options` to null. This process supplies
+/// the vector merge operator and FTS compaction filter.
+pub async fn run_standalone_compactor(config: Config) -> Result<()> {
+    storage::run_standalone_compactor(&config).await
+}
