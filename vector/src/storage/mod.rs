@@ -384,6 +384,9 @@ pub async fn run_standalone_compactor(config: &Config) -> Result<()> {
         merge_operator::VectorDbMergeOperator::new(config.dimensions as usize),
     );
     let compactor = builder
+        .with_metrics_recorder(Arc::new(
+            common::storage::metrics_recorder::MetricsRsRecorder,
+        ))
         .with_compaction_filter_supplier(
             compaction_filter::VectorCompactionFilterSupplier::shared(),
         )
