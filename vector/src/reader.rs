@@ -5,21 +5,22 @@
 //! not hold a write lease, so multiple readers can coexist with a single
 //! writer.
 
-use crate::Vector;
 use crate::db::VectorDbRead;
 use crate::error::{Error, Result};
 use crate::model::{Query, ReaderConfig, SearchOptions, SearchResult};
 use crate::query_engine::{QueryEngine, QueryEngineOptions};
 use crate::serde::vector_bitmap::VectorBitmap;
-use crate::storage::VectorDbStorageReadExt;
 use crate::storage::merge_operator::VectorDbMergeOperator;
+use crate::storage::VectorDbStorageReadExt;
 use crate::write::indexer::tree::centroids::{
     LeveledCentroidIndex, StoredCentroidReader, TreeDepth,
 };
+use crate::Vector;
 use async_trait::async_trait;
-use common::StorageSemantics;
+use common::storage::factory::{create_storage_read, StorageReaderRuntime};
 use common::storage::StorageRead;
-use common::storage::factory::{StorageReaderRuntime, create_storage_read};
+use common::StorageConfig;
+use common::StorageSemantics;
 use std::sync::Arc;
 
 /// Read-only client for querying a vector database.
@@ -37,6 +38,24 @@ pub struct VectorDbReader {
     /// FTS deletions bitmap loaded at open time. The reader only supports
     /// static dbs, so this is loaded once and shared with each QueryEngine.
     deletions: Arc<VectorBitmap>,
+}
+
+/// Copy the settings-file knobs the cell writes (`manifest_poll_interval`,
+/// native object-store cache) onto the reader options. In-memory storage and
+/// a missing `settings_path` keep [`DbReaderOptions::default`].
+fn db_reader_options(storage: &StorageConfig) -> Result<slatedb::config::DbReaderOptions> {
+    let mut options = slatedb::config::DbReaderOptions::default();
+    let StorageConfig::SlateDb(slate) = storage else {
+        return Ok(options);
+    };
+    let Some(path) = &slate.settings_path else {
+        return Ok(options);
+    };
+    let settings = slatedb::config::Settings::from_file(path)
+        .map_err(|err| Error::Storage(format!("reader settings {path}: {err}")))?;
+    options.manifest_poll_interval = settings.manifest_poll_interval;
+    options.object_store_cache_options = settings.object_store_cache_options;
+    Ok(options)
 }
 
 impl VectorDbReader {
@@ -62,7 +81,7 @@ impl VectorDbReader {
                 .with_segment_extractor(
                     crate::storage::segment_extractor::VectorSegmentExtractor::shared(),
                 ),
-            slatedb::config::DbReaderOptions::default(),
+            db_reader_options(&config.storage)?,
         )
         .await?;
 
@@ -147,15 +166,15 @@ impl VectorDbRead for VectorDbReader {
 
 #[cfg(test)]
 mod tests {
-    use crate::VectorDb;
     use crate::db::VectorDbRead;
     use crate::model::{Config, Query, ReaderConfig, Vector};
     use crate::reader::VectorDbReader;
     use crate::serde::collection_meta::DistanceMetric;
-    use common::StorageConfig;
+    use crate::VectorDb;
     use common::storage::config::{
         LocalObjectStoreConfig, ObjectStoreConfig, SlateDbStorageConfig,
     };
+    use common::StorageConfig;
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -212,5 +231,52 @@ mod tests {
         // then - closest vector should be vec-1
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].vector.id, "vec-1");
+    }
+
+    #[test]
+    fn settings_file_sets_poll_and_object_store_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reader.json");
+        std::fs::write(
+            &path,
+            r#"{
+              "manifest_poll_interval": "1500ms",
+              "object_store_cache_options": {
+                "root_folder": "/data/native-osc",
+                "max_cache_size_bytes": 1048576,
+                "cache_puts": false,
+                "preload_disk_cache_on_startup": "AllSst",
+                "scan_interval": "15s"
+              }
+            }"#,
+        )
+        .unwrap();
+        let storage = StorageConfig::SlateDb(SlateDbStorageConfig {
+            path: "data".into(),
+            object_store: ObjectStoreConfig::Local(LocalObjectStoreConfig {
+                path: dir.path().to_str().unwrap().into(),
+            }),
+            settings_path: Some(path.display().to_string()),
+            block_cache: None,
+            meta_cache: None,
+        });
+        let options = super::db_reader_options(&storage).unwrap();
+        assert_eq!(options.manifest_poll_interval, Duration::from_millis(1500));
+        assert_ne!(
+            options.manifest_poll_interval,
+            slatedb::config::DbReaderOptions::default().manifest_poll_interval
+        );
+        let cache = options.object_store_cache_options;
+        assert_eq!(
+            cache
+                .root_folder
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .as_deref(),
+            Some("/data/native-osc")
+        );
+        assert_eq!(cache.max_cache_size_bytes, Some(1_048_576));
+        assert!(!cache.cache_puts);
+        assert_eq!(cache.scan_interval, Some(Duration::from_secs(15)));
     }
 }

@@ -11,9 +11,9 @@ use super::metrics_recorder::{MetricsRsRecorder, MixtricsBridge as MetricsRsRegi
 use super::slate::{SlateDbStorage, SlateDbStorageReader};
 use super::{MergeOperator, Storage, StorageError, StorageRead, StorageResult};
 use slatedb::config::Settings;
-pub use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::foyer::{FoyerCache, FoyerCacheOptions};
 pub use slatedb::db_cache::foyer_hybrid::FoyerHybridCache;
+pub use slatedb::db_cache::DbCache;
 pub use slatedb::db_cache::{CachedEntry, CachedKey, SplitCache};
 use slatedb::object_store::{self, ObjectStore};
 pub use slatedb::{CompactorBuilder, DbBuilder};
@@ -589,9 +589,11 @@ async fn build_cache(
                 shards = opts.shards,
                 "in-memory cache enabled"
             );
-            Ok(Some(
-                Arc::new(FoyerCache::new_with_opts(opts)) as Arc<dyn DbCache>
-            ))
+            Ok(Some(Arc::new(FoyerCache::new_metered(
+                opts,
+                format!("slatedb_{label}_cache"),
+                Box::new(MetricsRsRegistry),
+            )) as Arc<dyn DbCache>))
         }
     }
 }
