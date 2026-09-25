@@ -53,8 +53,8 @@ foyer = "0.22"
 # + per-unit L0 encode/upload/fence log + executor-wall compaction duration
 # + pending_compaction_specs (architect §55).
 # Architect §28: pin by commit sha, not branch (reproducible image builds).
-slatedb = { git = "https://github.com/chewbaucke/slatedb", rev = "3f02e49a7c7984365018c8c79266abff3ce3531b", features = ["compaction_filters"] }
-slatedb-common = { git = "https://github.com/chewbaucke/slatedb", rev = "3f02e49a7c7984365018c8c79266abff3ce3531b" }
+slatedb = { git = "https://github.com/chewbaucke/slatedb", rev = "31cc7566eebe9895f63e6a54ae10feeff1303ac1", features = ["compaction_filters"] }
+slatedb-common = { git = "https://github.com/chewbaucke/slatedb", rev = "31cc7566eebe9895f63e6a54ae10feeff1303ac1" }
 thiserror = "2.0"
 tokio = { version = "1.0", features = ["full", "test-util"] }
 tokio-util = "0.7"
